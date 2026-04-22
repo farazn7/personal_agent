@@ -1,0 +1,44 @@
+/* ── Reset + Base ─────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:          #0f0f11;
+  --bg-surface:  #18181c;
+  --bg-hover:    #222228;
+  --border:      #2a2a32;
+  --border-mid:  #3a3a45;
+  --text:        #e8e8f0;
+  --text-muted:  #888898;
+  --text-dim:    #55555f;
+  --accent:      #7c6af7;
+  --accent-soft: #2a2550;
+  --linkedin:    #0a66c2;
+  --linkedin-bg: #0d1a2e;
+  --hitl:        #f59e0b;
+  --hitl-bg:     #1c1505;
+  --success:     #22c55e;
+  --error:       #ef4444;
+  --radius:      10px;
+  --radius-lg:   16px;
+  --sidebar-w:   280px;
+  --font:        'Inter', system-ui, sans-serif;
+  --mono:        'JetBrains Mono', 'Fira Code', monospace;
+}
+
+html, body, #root {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Scrollbars ──────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-mid); border-radius: 3px; }
+
+/* ── Selection ───────────────────────────────────────────────── */
+::selection { background: var(--accent-soft); color: var(--text); }

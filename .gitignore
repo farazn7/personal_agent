@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+
+# ChromaDB
+data/chroma_db/
+
+# LangGraph SQLite fallback (if used during dev)
+*.db
+*.sqlite
+
+# Node / React
+ui/node_modules/
+ui/dist/
+ui/.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+myenv/
