@@ -1,71 +1,85 @@
 """
-graph.py — Main LangGraph pipeline assembly.
+graph.py — Parent orchestrator graph assembly.
 
 Structure:
-    START
-      -> memory_inject
-      -> router
-      -> [chat | linkedin | rag]
-      -> memory_update
-    END
+  START → memory_inject → router → [chat | rag | linkedin] → memory_update → END
 
-The linkedin subgraph uses state-flag HITL (not interrupt()).
-When _li_needs_hitl=True the subgraph routes itself to END internally.
-server.py detects the flag after the graph finishes and emits the hitl SSE.
-The /api/hitl endpoint re-runs the full graph with _li_hitl_complete=True,
-which causes researcher and clarifier to skip their LLM work and the
-writing pipeline to run with the user's answers already in state.
+Each subgraph is compiled via its factory function and added as a node.
+LangGraph automatically maps overlapping fields between OrchestratorState
+and each subgraph's private state schema.
+
+HITL: The LinkedIn subgraph uses interrupt() inside its clarifier node.
+When paused, the checkpoint is saved by the parent's checkpointer.
+Resume with Command(resume=answers) — the graph continues mid-node.
+No re-running memory_inject, router, or researcher.
 """
 
 import logging
 from langgraph.graph import StateGraph, START, END
 
-from state import GlobalState
-from agents.router import router_node, route_decision
-from agents.memory_nodes import memory_inject_node, memory_update_node
+from states.orchestrator import OrchestratorState
+from nodes.router import router_node, route_decision
+from nodes.memory import memory_inject_node, memory_update_node
 
 logger = logging.getLogger(__name__)
 
 
 def build_graph(checkpointer=None, store=None):
-    from subgraphs.chat import chat_subgraph
-    from subgraphs.linkedin import linkedin_subgraph
-    from subgraphs.rag import rag_subgraph
+    """
+    Build and compile the parent orchestrator graph.
 
-    g = StateGraph(GlobalState)
+    Args:
+        checkpointer: LangGraph checkpointer (required for interrupt() to work).
+        store: LangGraph BaseStore for LTM (InMemoryStore in production).
+    """
+    from subgraphs.chat import build_chat_subgraph
+    from subgraphs.rag import build_rag_subgraph
+    from subgraphs.linkedin import build_linkedin_subgraph
 
+    chat_sg     = build_chat_subgraph()
+    rag_sg      = build_rag_subgraph()
+    linkedin_sg = build_linkedin_subgraph()
+
+    g = StateGraph(OrchestratorState)
+
+    # Nodes
     g.add_node("memory_inject",  memory_inject_node)
     g.add_node("router",         router_node)
-    g.add_node("chat",           chat_subgraph)
-    g.add_node("linkedin",       linkedin_subgraph)
-    g.add_node("rag",            rag_subgraph)
+    g.add_node("chat",           chat_sg)         # compiled subgraph as node
+    g.add_node("rag",            rag_sg)          # compiled subgraph as node
+    g.add_node("linkedin",       linkedin_sg)     # compiled subgraph as node
     g.add_node("memory_update",  memory_update_node)
 
+    # Edges
     g.add_edge(START, "memory_inject")
     g.add_edge("memory_inject", "router")
 
     g.add_conditional_edges(
         "router",
         route_decision,
-        {
-            "chat":     "chat",
-            "linkedin": "linkedin",
-            "rag":      "rag",
-        },
+        {"chat": "chat", "rag": "rag", "linkedin": "linkedin"},
     )
 
     g.add_edge("chat",     "memory_update")
-    g.add_edge("linkedin", "memory_update")
     g.add_edge("rag",      "memory_update")
+    g.add_edge("linkedin", "memory_update")
     g.add_edge("memory_update", END)
 
+    # Compile with checkpointer (REQUIRED for interrupt) and store (for LTM)
     return g.compile(checkpointer=checkpointer, store=store)
 
 
 async def get_graph_async():
+    """
+    Production graph with PostgreSQL checkpointer + InMemoryStore for LTM.
+
+    Falls back to MemorySaver if PostgreSQL is unavailable.
+    Falls back to no LTM if the embedding model is unavailable.
+    """
     checkpointer = None
     store        = None
 
+    # ── Checkpointer: PostgreSQL (preferred) or MemorySaver (fallback) ─────
     try:
         import psycopg
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -79,6 +93,7 @@ async def get_graph_async():
         from langgraph.checkpoint.memory import MemorySaver
         checkpointer = MemorySaver()
 
+    # ── Store: InMemoryStore with embeddings for LTM ───────────────────────
     try:
         from langgraph.store.memory import InMemoryStore
         from langchain_ollama import OllamaEmbeddings
@@ -89,10 +104,11 @@ async def get_graph_async():
     except Exception as e:
         logger.warning(f"LTM store setup failed ({e}) — LTM disabled.")
 
+    # ── Compile ────────────────────────────────────────────────────────────
     graph = build_graph(checkpointer=checkpointer, store=store)
     logger.info("Main graph compiled and ready.")
 
-    # Populate InMemoryStore from PostgreSQL so facts survive restarts
+    # ── Populate InMemoryStore from PostgreSQL so facts survive restarts ───
     if store:
         try:
             from memory.ltm import load_ltm_from_postgres
@@ -104,5 +120,6 @@ async def get_graph_async():
 
 
 def get_graph_sync_fallback():
+    """Synchronous fallback for testing — MemorySaver, no LTM store."""
     from langgraph.checkpoint.memory import MemorySaver
     return build_graph(checkpointer=MemorySaver(), store=None)

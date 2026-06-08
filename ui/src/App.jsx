@@ -197,7 +197,7 @@ export default function App() {
 
     streamResponse(
       `${API}/api/hitl`,
-      { original_input: hitlOriginal, answers, thread_id: threadId },
+      { answers, thread_id: threadId },
       null
     )
   }, [hitlOriginal, threadId, streamResponse])
@@ -207,7 +207,7 @@ export default function App() {
     setHitlQuestions([])
     streamResponse(
       `${API}/api/hitl`,
-      { original_input: hitlOriginal, answers: {}, thread_id: threadId },
+      { answers: {}, thread_id: threadId },
       null
     )
   }, [hitlOriginal, threadId, streamResponse])
@@ -271,6 +271,7 @@ export default function App() {
           messages={messages}
           streaming={streaming}
           currentAgent={currentAgent}
+          onSend={sendMessage}
         />
         {hitlPending && (
           <HitlForm

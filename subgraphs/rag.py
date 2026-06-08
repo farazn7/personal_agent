@@ -1,14 +1,15 @@
 """
-subgraphs/rag.py — RAG (personal knowledge base) subgraph.
+subgraphs/rag.py — RAG (personal knowledge base) subgraph (isolated).
 
-Pipeline: START → researcher_node → search_response_node → END
+Pipeline: START → researcher_node → synthesizer_node → END
+State:   RAGState (4 overlapping + 2 private fields)
 
 researcher_node:
-  - Fires asyncio.gather for concurrent: LTM store search + ChromaDB facts + optional web
+  - Fires asyncio.gather for concurrent: ChromaDB facts + optional web search
   - Web search only if research_mode is hybrid or open_book (set by router)
-  - Keyword extraction from user query drives all three searches
+  - Keyword extraction from user query drives searches
 
-search_response_node:
+synthesizer_node:
   - Synthesizes ChromaDB facts + LTM context + optional web into a grounded answer
   - Structured system prompt prevents adding info beyond what sources say
   - If sources are thin, says so and suggests what to add to documents
@@ -18,10 +19,9 @@ import asyncio
 import logging
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
-from langgraph.store.base import BaseStore
-from langchain_core.runnables import RunnableConfig
 
-from state import GlobalState
+from states.rag import RAGState
+from shared import last_human_content, extract_keywords, build_rag_queries
 from llm_config import llm_write as llm_fast
 from tools.web_search import web_search_async
 from tools.rag_engine import retrieve_facts
@@ -30,70 +30,23 @@ logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Shared keyword extractor
-# ══════════════════════════════════════════════════════════════════════════
-
-import re
-
-_KW_STOP = {
-    "a","an","the","and","or","but","in","on","at","to","for","of","with","by",
-    "is","are","was","were","be","been","i","my","me","we","you","your","it","its",
-    "what","can","could","would","should","have","has","had","do","did",
-    "please","help","need","want","like","tell","show","give","find",
-    "search","look","check","list","show","get","fetch","retrieve",
-}
-
-
-def _keywords(text: str, max_kw: int = 6) -> list[str]:
-    cleaned = re.sub(r"[^\w\s]", " ", text.lower())
-    seen, out = set(), []
-    for w in cleaned.split():
-        if w not in _KW_STOP and len(w) > 2 and w not in seen:
-            seen.add(w)
-            out.append(w)
-            if len(out) >= max_kw:
-                break
-    return out
-
-
-def _rag_queries(text: str) -> list[str]:
-    """Build 1-2 search queries from keywords."""
-    kw = _keywords(text)
-    if not kw:
-        return [text[:80]]
-    queries = [" ".join(kw[:4])]
-    if len(kw) > 4:
-        queries.append(" ".join(kw[4:]))
-    return queries
-
-
-# ══════════════════════════════════════════════════════════════════════════
 # Researcher node — concurrent I/O
 # ══════════════════════════════════════════════════════════════════════════
 
-async def researcher_node(
-    state: GlobalState,
-    config: RunnableConfig,
-    *,
-    store: BaseStore,
-) -> dict:
+async def researcher_node(state: RAGState) -> dict:
     """
-    Concurrent retrieval: ChromaDB facts + LTM store + optional web search.
+    Concurrent retrieval: ChromaDB facts + optional web search.
 
-    All three fire at the same time via asyncio.gather.
+    Both fire at the same time via asyncio.gather.
     Web search only runs for hybrid/open_book research_mode.
     """
-    messages   = state.get("messages", [])
-    from langchain_core.messages import HumanMessage as _HM
-    human_msgs = [m for m in messages if isinstance(m, _HM)]
-    user_input = human_msgs[-1].content if human_msgs else ""
+    messages       = state.get("messages", [])
+    user_input     = last_human_content(messages)
     research_mode  = state.get("research_mode", "closed_book")
     search_queries = state.get("search_queries", [])  # from router
-    user_id        = state.get("user_id", "default")
     ltm_context    = state.get("ltm_context", "")     # already loaded by memory_inject
 
-    queries = search_queries or _rag_queries(user_input)
-    kw      = _keywords(user_input)
+    queries = search_queries or build_rag_queries(user_input)
 
     # ── Async wrappers for sync libs ───────────────────────────────────────
     loop = asyncio.get_running_loop()
@@ -124,19 +77,14 @@ async def researcher_node(
         f"ltm={'yes' if ltm_context else 'empty'}"
     )
 
-    # Store results in state for search_response_node
-    # Using a convention: store in messages metadata or pass via state fields.
-    # We use a temporary state update pattern — these go into the subgraph's
-    # local state and are NOT stored in the PostgreSQL checkpoint.
     return {
-        "_rag_chroma_facts": chroma_facts,
-        "_rag_web_results":  web_results,
-        "current_agent":     "Researcher",
+        "chroma_results": chroma_facts,
+        "web_results":    web_results,
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Search response node
+# Synthesizer node
 # ══════════════════════════════════════════════════════════════════════════
 
 _SEARCH_RESPONSE_SYSTEM = """\
@@ -155,17 +103,15 @@ SOURCE PRIORITY: Documents > LTM Memory > Web (web is supplementary context only
 """
 
 
-async def search_response_node(state: GlobalState) -> dict:
+async def synthesizer_node(state: RAGState) -> dict:
     """
     Synthesize all retrieved sources into a grounded answer.
     """
-    from config import STM_WINDOW_SIZE
-    messages     = state.get("messages", [])
-    from langchain_core.messages import HumanMessage as _HM
-    user_input   = next((m.content for m in reversed(messages) if isinstance(m, _HM)), "")
-    ltm_context  = state.get("ltm_context", "")
-    chroma_facts = state.get("_rag_chroma_facts", "")
-    web_results  = state.get("_rag_web_results", "")
+    messages       = state.get("messages", [])
+    user_input     = last_human_content(messages)
+    ltm_context    = state.get("ltm_context", "")
+    chroma_facts   = state.get("chroma_results", "")
+    web_results    = state.get("web_results", "")
 
     # Build source block
     parts = []
@@ -194,25 +140,24 @@ async def search_response_node(state: GlobalState) -> dict:
         ])
         reply = response.content.strip()
     except Exception as e:
-        logger.error(f"[rag search_response] LLM failed: {e}")
+        logger.error(f"[rag synthesizer] LLM failed: {e}")
         reply = f"Error generating response: {e}"
 
     return {
-        "messages":      [AIMessage(content=reply)],
-        "current_agent": "Database Search",
+        "messages": [AIMessage(content=reply)],
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Subgraph assembly
+# Subgraph factory
 # ══════════════════════════════════════════════════════════════════════════
 
-_g = StateGraph(GlobalState)
-_g.add_node("researcher",      researcher_node)
-_g.add_node("search_response", search_response_node)
-
-_g.add_edge(START,             "researcher")
-_g.add_edge("researcher",      "search_response")
-_g.add_edge("search_response", END)
-
-rag_subgraph = _g.compile()
+def build_rag_subgraph():
+    """Build and compile the RAG subgraph. Call this instead of using a module-level singleton."""
+    g = StateGraph(RAGState)
+    g.add_node("researcher",   researcher_node)
+    g.add_node("synthesizer",  synthesizer_node)
+    g.add_edge(START,          "researcher")
+    g.add_edge("researcher",   "synthesizer")
+    g.add_edge("synthesizer",  END)
+    return g.compile()

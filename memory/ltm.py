@@ -17,6 +17,7 @@ from typing import List
 from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.store.base import BaseStore
+from langsmith import traceable
 
 from config import (
     LTM_MAX_FACTS_PER_TURN, LTM_NAMESPACE_PREFIX,
@@ -70,27 +71,36 @@ class MemoryDecision(BaseModel):
 _EXTRACT_SYSTEM = """\
 You are extracting long-term personal facts about the USER from a conversation.
 
+CRITICAL RULE: Every fact MUST be a complete, self-contained sentence.
+Someone reading the fact with NO other context should fully understand it.
+Include WHO, WHAT, WHERE, WHEN if mentioned. Include project/event names.
+
 CATEGORIES:
   skill        — Named technical/professional skill they actually use.
-                 GOOD: "Proficient in Python and PyTorch"
+                 GOOD: "Proficient in Python and PyTorch for ML projects"
                  BAD:  "Likes technology" (vague)
   achievement  — Concrete accomplishment with measurable outcome.
-                 GOOD: "Got first rank in college ML hackathon"
+                 GOOD: "Won first place at the IRC robotics competition 2025"
                  BAD:  "Did well" (no specifics)
-  project      — Specific project they built. Include name, tech if stated.
+  project      — Specific project they built. MUST include project name/description + tech used.
+                 GOOD: "Built a home security system using agentic AI with per-camera agents and spatial-temporal anomaly detection"
+                 BAD:  "Used confidence levels to detect suspicious frames" (fragment, no project context)
   event        — Named competition, hackathon, or conference attended.
+                 GOOD: "Participated in a CN competition building an agentic AI architecture for suspicious activity detection"
+                 BAD:  "Participated in a competition" (no name or topic)
   role         — Specific job title or organizational role.
   education    — Degree, major, institution — only if explicitly stated.
   preference   — Strong, explicitly stated work or career preference.
   identity     — Name, city, current employer — only if directly stated.
 
-DO NOT extract:
-  - Vague or generic statements
-  - Future plans ("I might", "planning to")
-  - Transient states ("I'm tired", "busy today")
-  - Anything the ASSISTANT said
-  - Pure questions
-  - Opinions about external things
+IMPORTANT:
+  - PREFER fewer, richer facts over many fragments.
+  - Combine related details into ONE fact instead of splitting.
+    BAD:  3 separate facts about the same project ("used spatial data", "used agents", "detected anomalies")
+    GOOD: 1 combined fact ("Built a project using agentic AI with spatial-temporal data to detect anomalies in home security cameras")
+  - Do NOT extract fragments that only make sense in the conversation context.
+  - Do NOT extract anything the ASSISTANT said — only USER facts.
+  - Do NOT extract future plans, questions, or transient states.
 
 EXISTING MEMORIES (do not re-extract):
 {existing_memories}
@@ -200,6 +210,7 @@ async def load_ltm_from_postgres(user_id: str, store: BaseStore) -> int:
 # Extraction — called from memory_update_node
 # =============================================================================
 
+@traceable(run_type="tool", name="ltm_extract_facts")
 async def extract_and_store_facts(
     user_input: str,
     ai_output: str,

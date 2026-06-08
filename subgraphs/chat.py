@@ -1,9 +1,10 @@
 """
-subgraphs/chat.py — Chat subgraph.
+subgraphs/chat.py — Chat subgraph (isolated).
 
 Pipeline: START → chatbot_node → END
+State:   ChatState (3 overlapping fields: messages, stm_summary, ltm_context)
 
-FIXES APPLIED:
+Features:
   1. Message trimming — only last STM_WINDOW_SIZE messages go to Ollama.
      Passing full history was causing 26s responses and context bleed
      where the LLM "remembered" previous topics and mixed them with
@@ -30,7 +31,8 @@ from datetime import date
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
 
-from state import GlobalState
+from states.chat import ChatState
+from shared import last_human_content
 from config import STM_WINDOW_SIZE
 from llm_config import llm_write as llm_fast
 from memory.stm import build_llm_messages
@@ -211,6 +213,17 @@ def _result_is_relevant(web_text: str, user_input: str) -> bool:
 _BASE_SYSTEM = """\
 You are a friendly, direct, and knowledgeable personal AI assistant.
 
+YOUR CAPABILITIES — tell users about these when asked:
+1. **General Chat** — answer questions, explain concepts, have conversations.
+   You can also search the web for current events, news, scores, and live data.
+2. **Personal Knowledge Base (RAG)** — search the user's personal documents,
+   resume, skills, projects, and achievements. Triggered by queries like
+   "what skills do I have?", "search my resume", "list my projects".
+3. **LinkedIn Post Generator** — write professional LinkedIn posts with
+   research, fact-checking, and style matching. Triggered by requests like
+   "write a LinkedIn post about…", "draft a post announcing…".
+   Includes a clarification step to ask for missing details before writing.
+
 IDENTITY — NON-NEGOTIABLE:
 - You are an AI. You have NOT written code, worked at companies, built projects,
   or had personal experiences. Never say "I've worked with X" or "I built".
@@ -229,9 +242,10 @@ Keep responses concise. No preamble. No "Great question!".\
 """
 
 # Stricter version injected when web results are present
-_WEB_GROUNDING_SYSTEM = """\
+_WEB_GROUNDING_TEMPLATE = """\
 CRITICAL — WEB RESULTS GROUNDING:
-Web search results are provided below. You MUST follow these rules EXACTLY:
+Today's date is {today}. Web search results are provided below.
+You MUST follow these rules EXACTLY:
 
 1. Answer ONLY using the content in the web results.
 2. Do NOT use any knowledge from your training about this specific topic.
@@ -240,18 +254,31 @@ Web search results are provided below. You MUST follow these rules EXACTLY:
    or fact that is not explicitly present in the results below.
 4. If the web results don't answer the question, say:
    "The search results don't contain clear information about this. Want me to try a different search?"
-5. Do NOT add context from 2020, 2021, 2022, 2023 etc. unless the results mention it.
-   Only report what the results say about the current situation.
+5. DISCARD results from previous years (2024, 2023, etc.) unless the user
+   explicitly asked about that time period. Prioritize the most recent results.
+6. Keep your answer concise — summarize the key points in 3-5 bullet points.
 
 Attribute facts naturally: "According to search results..." — never invent source names.\
 """
+
+
+def _truncate_web_results(text: str, max_chars: int = 1500) -> str:
+    """Truncate web results to avoid overwhelming the local LLM."""
+    if len(text) <= max_chars:
+        return text
+    # Try to cut at a sentence boundary
+    cut = text[:max_chars]
+    last_period = cut.rfind('.')
+    if last_period > max_chars // 2:
+        return cut[:last_period + 1] + '\n[...remaining results truncated]'
+    return cut + '\n[...remaining results truncated]'
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # Chatbot node
 # ══════════════════════════════════════════════════════════════════════════
 
-async def chatbot_node(state: GlobalState) -> dict:
+async def chatbot_node(state: ChatState) -> dict:
     """
     Chat node with message trimming, follow-up web search, and strict grounding.
     """
@@ -260,11 +287,7 @@ async def chatbot_node(state: GlobalState) -> dict:
     ltm_context  = state.get("ltm_context", "")
 
     # Always use the last HumanMessage — never accidentally use an AIMessage
-    user_input = ""
-    for m in reversed(all_messages):
-        if isinstance(m, HumanMessage):
-            user_input = m.content
-            break
+    user_input = last_human_content(all_messages)
 
     # Get the previous AI message for follow-up detection
     ai_msgs = [m for m in all_messages if isinstance(m, AIMessage)]
@@ -286,10 +309,10 @@ async def chatbot_node(state: GlobalState) -> dict:
         query = _build_search_query(raw_query, stm_summary)
         logger.info(f"[chat] web search → {query[:70]}")
         try:
-            raw_web = await web_search_async([query], max_results=5)
+            raw_web = await web_search_async([query], max_results=3)
             if raw_web and "no results" not in raw_web.lower():
                 if _result_is_relevant(raw_web, user_input) or _result_is_relevant(raw_web, raw_query):
-                    web_context = raw_web
+                    web_context = _truncate_web_results(raw_web)
                     logger.debug("[chat] web results accepted")
                 else:
                     logger.debug("[chat] web results not relevant — discarded")
@@ -308,7 +331,8 @@ async def chatbot_node(state: GlobalState) -> dict:
 
     if web_context:
         # Insert BOTH grounding instruction and results before the last human message
-        llm_messages.insert(-1, SystemMessage(content=_WEB_GROUNDING_SYSTEM))
+        grounding = _WEB_GROUNDING_TEMPLATE.format(today=date.today().isoformat())
+        llm_messages.insert(-1, SystemMessage(content=grounding))
         llm_messages.insert(-1, SystemMessage(
             content=f"[WEB SEARCH RESULTS]:\n{web_context}"
         ))
@@ -322,18 +346,18 @@ async def chatbot_node(state: GlobalState) -> dict:
         reply = f"Error: {e}\n\nIs Ollama running? Try: `ollama serve`"
 
     return {
-        "messages":      [AIMessage(content=reply)],
-        "current_agent": "Chatbot",
+        "messages": [AIMessage(content=reply)],
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Subgraph assembly
+# Subgraph factory
 # ══════════════════════════════════════════════════════════════════════════
 
-_g = StateGraph(GlobalState)
-_g.add_node("chatbot", chatbot_node)
-_g.add_edge(START, "chatbot")
-_g.add_edge("chatbot", END)
-
-chat_subgraph = _g.compile()
+def build_chat_subgraph():
+    """Build and compile the chat subgraph. Call this instead of using a module-level singleton."""
+    g = StateGraph(ChatState)
+    g.add_node("chatbot", chatbot_node)
+    g.add_edge(START, "chatbot")
+    g.add_edge("chatbot", END)
+    return g.compile()

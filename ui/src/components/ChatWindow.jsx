@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import './ChatWindow.css'
 
-export default function ChatWindow({ messages, streaming, currentAgent }) {
+export default function ChatWindow({ messages, streaming, currentAgent, onSend }) {
   const bottomRef = useRef(null)
 
   useEffect(() => {
@@ -16,9 +16,9 @@ export default function ChatWindow({ messages, streaming, currentAgent }) {
           <h2 className="empty-title">Personal Assistant</h2>
           <p className="empty-sub">Ask anything, search your profile, or generate a LinkedIn post.</p>
           <div className="empty-examples">
-            <div className="example-chip">What skills do I have?</div>
-            <div className="example-chip">Write a LinkedIn post about my latest project</div>
-            <div className="example-chip">What happened in AI this week?</div>
+            <button className="example-chip" onClick={() => onSend?.('What skills do I have?')}>What skills do I have?</button>
+            <button className="example-chip" onClick={() => onSend?.('Write a LinkedIn post about my latest project')}>Write a LinkedIn post about my latest project</button>
+            <button className="example-chip" onClick={() => onSend?.('What happened in AI this week?')}>What happened in AI this week?</button>
           </div>
         </div>
       </div>

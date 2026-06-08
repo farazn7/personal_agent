@@ -15,6 +15,7 @@ from typing import List
 import chromadb
 from chromadb.config import Settings
 from langchain_ollama import OllamaEmbeddings
+from langsmith import traceable
 
 from config import (
     CHROMA_DB_PATH, OLLAMA_EMBED_MODEL, OLLAMA_BASE_URL,
@@ -41,6 +42,7 @@ def _get_collection(client: chromadb.PersistentClient, name: str):
     )
 
 
+@traceable(run_type="retriever", name="chromadb_facts")
 def retrieve_facts(queries: List[str], n_results: int = 5) -> str:
     """
     Retrieve personal fact chunks from ChromaDB.
@@ -74,6 +76,7 @@ def retrieve_facts(queries: List[str], n_results: int = 5) -> str:
         return ""
 
 
+@traceable(run_type="retriever", name="chromadb_linkedin_examples")
 def retrieve_linkedin_examples(queries: List[str], n_results: int = 3) -> str:
     """
     Retrieve past LinkedIn post examples for style matching.

@@ -1,5 +1,5 @@
 """
-agents/router.py — Two-tier router.
+nodes/router.py — Two-tier router for the parent orchestrator.
 
 TIER 1 — Regex fast-path (< 1ms, no LLM)
   Detects linkedin and rag patterns. Returns "chat" as default.
@@ -8,10 +8,7 @@ TIER 2 — LLM structured output (llama3.2:3b, ~300ms)
   Only fires for linkedin/rag to get research_mode + queries.
   Chat bypasses entirely.
 
-HITL RESUME BYPASS:
-  When _li_hitl_complete=True the router skips ALL LLM work and returns
-  the route/mode/queries already in the checkpoint state. This avoids the
-  14-second re-routing cost on every HITL resume.
+No HITL bypass needed — with interrupt(), the router never re-runs on resume.
 """
 
 import re
@@ -21,7 +18,8 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.runnables import RunnableConfig
 
-from state import GlobalState
+from states.orchestrator import OrchestratorState
+from shared import last_human_content
 from config import ROUTER_MIN_CONFIDENCE
 from llm_config import llm_router
 
@@ -153,28 +151,12 @@ async def _llm_classify(user_input: str, context: str) -> RouterDecision:
 # Graph node
 # =============================================================================
 
-async def router_node(state: GlobalState, config: RunnableConfig) -> dict:
-    # --- HITL RESUME BYPASS ---
-    # On HITL resume the route/mode/queries are already in the checkpoint.
-    # Skip all LLM work — costs 14s and sees duplicate messages.
-    if state.get("_li_hitl_complete", False):
-        route          = state.get("route", "linkedin")
-        research_mode  = state.get("research_mode", "closed_book")
-        search_queries = state.get("search_queries", [])
-        logger.debug(f"[router] HITL resume bypass → {route} | {research_mode}")
-        return {
-            "route":          route,
-            "research_mode":  research_mode,
-            "search_queries": search_queries,
-            "current_agent":  "Router",
-        }
-
+async def router_node(state: OrchestratorState, config: RunnableConfig) -> dict:
     messages   = state.get("messages", [])
-    user_input = messages[-1].content if messages else ""
+    user_input = last_human_content(messages)
 
     if not user_input.strip():
-        return {"route": "chat", "research_mode": "closed_book",
-                "search_queries": [], "current_agent": "Router"}
+        return {"route": "chat", "research_mode": "closed_book", "search_queries": []}
 
     route = _fast_route(user_input)
 
@@ -185,7 +167,6 @@ async def router_node(state: GlobalState, config: RunnableConfig) -> dict:
             "route":          "chat",
             "research_mode":  "closed_book",
             "search_queries": [],
-            "current_agent":  "Router",
         }
 
     # linkedin/rag: call LLM for research_mode + queries
@@ -218,9 +199,8 @@ async def router_node(state: GlobalState, config: RunnableConfig) -> dict:
         "route":          route,
         "research_mode":  decision.research_mode,
         "search_queries": search_queries,
-        "current_agent":  "Router",
     }
 
 
-def route_decision(state: GlobalState) -> str:
+def route_decision(state: OrchestratorState) -> str:
     return state.get("route", "chat")

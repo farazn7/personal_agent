@@ -8,11 +8,14 @@ import asyncio
 import logging
 from typing import List
 
+from langsmith import traceable
+
 from config import WEB_SEARCH_MAX_RESULTS
 
 logger = logging.getLogger(__name__)
 
 
+@traceable(run_type="tool", name="web_search")
 async def web_search_async(
     queries: List[str],
     max_results: int = WEB_SEARCH_MAX_RESULTS,

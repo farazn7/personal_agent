@@ -1,20 +1,16 @@
 """
-subgraphs/linkedin.py — LinkedIn post generation subgraph.
+subgraphs/linkedin.py — LinkedIn post generation subgraph (isolated).
 
 Pipeline:
-  researcher -> clarifier -> (conditional) -> generator -> evaluator -> style_matcher
-                                |
-                                +-- if _li_needs_hitl=True --> END
-                                    server.py emits hitl SSE
-                                    user answers → /api/hitl with merged answers
+  START → researcher → clarifier → generator → evaluator → style_matcher → END
 
-MULTI-TURN CLARIFIER:
-  Up to 2 rounds of HITL. On each resume, clarifier re-evaluates with all
-  accumulated answers. If still insufficient and rounds < 2, asks again.
-  After 2 rounds, proceeds regardless (user can always provide more in the post).
+State: LinkedInState (4 overlapping + 7 private fields)
 
-HITL DESIGN — STATE FLAGS (no interrupt()):
-  interrupt() is broken in this LangGraph version. State booleans instead.
+HITL DESIGN — native interrupt():
+  The clarifier calls interrupt(questions). The graph pauses mid-node and the
+  checkpoint is saved. When the server calls Command(resume=answers), the
+  interrupt() call returns the user's answers and the node continues.
+  Up to 2 rounds. No state flags needed.
 """
 
 import re
@@ -23,11 +19,11 @@ import asyncio
 import logging
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
-from langgraph.store.base import BaseStore
+from langgraph.errors import NodeInterrupt
 
-from state import GlobalState
+from states.linkedin import LinkedInState
+from shared import last_human_content, extract_keywords, build_rag_queries
 from llm_config import llm_write, llm_precise
 from tools.web_search import web_search_async
 from tools.rag_engine import retrieve_linkedin_examples
@@ -36,71 +32,33 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Shared utilities
+# Shared helpers
 # =============================================================================
 
-_KW_STOP = {
-    "a","an","the","and","or","but","in","on","at","to","for","of","with","by",
-    "is","are","was","were","be","been","i","my","me","we","you","your","it","its",
-    "what","can","could","would","should","have","has","had","do","did","please",
-    "help","need","want","like","tell","show","give","find","write","draft",
-    "create","generate","make","compose","craft","post","linkedin","about",
-}
-
-
-def _last_human_content(messages: list) -> str:
-    """Return last HumanMessage content. Never accidentally returns an AIMessage."""
-    for m in reversed(messages):
-        if isinstance(m, HumanMessage):
-            return m.content
-    return ""
-
-
-def _keywords(text: str, max_kw: int = 6) -> list:
-    cleaned = re.sub(r"[^\w\s]", " ", text.lower())
-    seen, out = set(), []
-    for w in cleaned.split():
-        if w not in _KW_STOP and len(w) > 2 and w not in seen:
-            seen.add(w)
-            out.append(w)
-            if len(out) >= max_kw:
-                break
-    return out
-
-
-def _rag_queries(text: str) -> list:
-    kw = _keywords(text)
-    if not kw:
-        return [text[:80]]
-    queries = [" ".join(kw[:4])]
-    if len(kw) > 4:
-        queries.append(" ".join(kw[4:]))
-    return queries
+def _is_non_answer(text: str) -> bool:
+    """Detect confused non-answers that would cause hallucination if treated as facts."""
+    return (
+        text.endswith("?") or
+        bool(re.search(
+            r"^(umm?|uh|hmm|idk|i don.t know|what do you|u want|you want|do you|which)",
+            text, re.IGNORECASE
+        ))
+    )
 
 
 # =============================================================================
 # 1. Researcher node
 # =============================================================================
 
-async def researcher_node(
-    state: GlobalState,
-    config: RunnableConfig,
-    *,
-    store: BaseStore,
-) -> dict:
+async def researcher_node(state: LinkedInState) -> dict:
     """
     Concurrent: web search (if hybrid/open_book) + ChromaDB style examples.
-    Skips on HITL resume — all research data is already in the checkpoint.
     """
-    if state.get("_li_hitl_complete", False):
-        logger.debug("[researcher] HITL resume — data already in checkpoint, skipping")
-        return {"current_agent": "Researcher"}
-
     messages       = state.get("messages", [])
-    user_input     = _last_human_content(messages)
+    user_input     = last_human_content(messages)
     research_mode  = state.get("research_mode", "closed_book")
     search_queries = state.get("search_queries", [])
-    queries        = search_queries or _rag_queries(user_input)
+    queries        = search_queries or build_rag_queries(user_input)
     loop           = asyncio.get_running_loop()
 
     async def _style_examples() -> str:
@@ -127,14 +85,13 @@ async def researcher_node(
         f"examples={'yes' if style_examples else 'no'}"
     )
     return {
-        "_li_web_results":    web_results,
-        "_li_style_examples": style_examples,
-        "current_agent":      "Researcher",
+        "web_results":    web_results,
+        "style_examples": style_examples,
     }
 
 
 # =============================================================================
-# 2. Clarifier — multi-turn state-flag HITL
+# 2. Clarifier — multi-turn HITL via interrupt()
 # =============================================================================
 
 _CLARIFIER_SYSTEM = """\
@@ -170,47 +127,25 @@ OUTPUT: Valid JSON only.
 """
 
 
-async def clarifier_node(state: GlobalState) -> dict:
+async def _evaluate_context(
+    user_input: str,
+    ltm_context: str,
+    web_results: str,
+    accumulated_answers: dict,
+) -> tuple[bool, list[str]]:
     """
-    Multi-turn state-flag HITL clarifier. No interrupt() used.
-
-    First run:
-      LLM evaluates available context. If questions needed, sets
-      _li_needs_hitl=True → conditional edge routes to END.
-      server.py emits hitl SSE with the questions.
-
-    Resume run (_li_hitl_complete=True, _li_hitl_rounds=N):
-      Re-evaluates with all accumulated answers so far.
-      If still needs more AND rounds < 2: asks again (new questions).
-      If sufficient OR rounds >= 2: clears flag → routes to generator.
+    Ask the LLM whether we have enough context to write the post.
+    Returns (needed: bool, questions: list[str]).
     """
-    messages     = state.get("messages", [])
-    user_input   = _last_human_content(messages)
-    ltm_context  = state.get("ltm_context", "")
-    web_results  = state.get("_li_web_results", "")
-    hitl_answers = state.get("_li_hitl_answers", {}) or {}
-    hitl_rounds  = state.get("_li_hitl_rounds", 0)
-    is_resume    = state.get("_li_hitl_complete", False)
-
-    # Hard limit: max 2 rounds of HITL regardless
-    if is_resume and hitl_rounds >= 2:
-        logger.info("[clarifier] max HITL rounds reached — proceeding to generator")
-        return {
-            "_li_needs_hitl":    False,
-            "_li_hitl_complete": False,
-            "current_agent":     "Clarifier",
-        }
-
     known_facts = ltm_context.strip() or "(none)"
     web_context = web_results.strip() or "(no web research)"
 
     # Build context including accumulated answers (for re-evaluation on resume)
     answers_section = ""
-    if hitl_answers:
+    if accumulated_answers:
         lines = ["User's answers to previous questions:"]
-        for q, a in hitl_answers.items():
+        for q, a in accumulated_answers.items():
             answer_text = str(a).strip()
-            # Only include genuine answers, not confused non-answers
             if answer_text and not _is_non_answer(answer_text):
                 lines.append(f"  Q: {q}")
                 lines.append(f"  A: {answer_text}")
@@ -245,46 +180,51 @@ async def clarifier_node(state: GlobalState) -> dict:
         logger.warning(f"[clarifier] LLM failed ({e}) — proceeding")
         needed, questions = False, []
 
-    if needed and questions:
-        logger.info(f"[clarifier] HITL round {hitl_rounds + 1}: {len(questions)} questions")
-        return {
-            "_li_needs_hitl":     True,
-            "_li_hitl_questions": questions,
-            "_li_hitl_complete":  False,   # reset so next resume re-enters clarifier
-            "current_agent":      "Clarifier",
-        }
-
-    logger.debug(f"[clarifier] sufficient context (round {hitl_rounds}) — proceeding")
-    return {
-        "_li_needs_hitl":     False,
-        "_li_hitl_questions": [],
-        "_li_hitl_complete":  False,
-        "current_agent":      "Clarifier",
-    }
+    return needed, questions
 
 
-def _route_after_clarifier(state: GlobalState) -> str:
-    if state.get("_li_needs_hitl", False):
-        return END
-    return "generator"
+async def clarifier_node(state: LinkedInState) -> dict:
+    """
+    HITL clarifier using NodeInterrupt (Python 3.10 compatible).
 
+    On first run: evaluates if questions are needed, raises NodeInterrupt
+    with the questions to pause the graph.
 
-def _is_non_answer(text: str) -> bool:
-    """Detect confused non-answers that would cause hallucination if treated as facts."""
-    return (
-        text.endswith("?") or
-        bool(re.search(
-            r"^(umm?|uh|hmm|idk|i don.t know|what do you|u want|you want|do you|which)",
-            text, re.IGNORECASE
-        ))
+    On resume: Command(resume=answers_dict) re-runs the node.
+    The answers are available via state — the server passes them as
+    hitl_answers in the Command update.
+    """
+    messages    = state.get("messages", [])
+    user_input  = last_human_content(messages)
+    ltm_context = state.get("ltm_context", "")
+    web_results = state.get("web_results", "")
+
+    # If we already have answers from a resume, we're done
+    existing_answers = state.get("hitl_answers", {})
+    if existing_answers:
+        logger.debug(f"[clarifier] resumed with {len(existing_answers)} answers")
+        return {"hitl_answers": existing_answers}
+
+    # First run — check if we need to ask questions
+    needed, questions = await _evaluate_context(
+        user_input, ltm_context, web_results, {}
     )
+
+    if not needed or not questions:
+        logger.debug("[clarifier] sufficient context — no questions needed")
+        return {"hitl_answers": {}}
+
+    logger.info(f"[clarifier] HITL: {len(questions)} questions")
+
+    # Pause the graph — NodeInterrupt works on Python 3.10
+    raise NodeInterrupt({"questions": questions, "round": 1})
 
 
 # =============================================================================
 # Fact list builder
 # =============================================================================
 
-def _build_fact_list(state: GlobalState) -> str:
+def _build_fact_list(state: LinkedInState) -> str:
     """
     Build the numbered fact list for the generator.
     Only includes confirmed, genuine information — no hallucination fodder.
@@ -293,13 +233,13 @@ def _build_fact_list(state: GlobalState) -> str:
     n     = 1
 
     messages   = state.get("messages", [])
-    user_input = _last_human_content(messages)  # always the original request
+    user_input = last_human_content(messages)
 
     if user_input.strip():
         items.append(f"{n}. [USER SAID]: {user_input.strip()}")
         n += 1
 
-    hitl_answers = state.get("_li_hitl_answers", {}) or {}
+    hitl_answers = state.get("hitl_answers", {}) or {}
     for q, a in hitl_answers.items():
         answer_text = str(a).strip()
         if not answer_text or _is_non_answer(answer_text):
@@ -308,7 +248,7 @@ def _build_fact_list(state: GlobalState) -> str:
         items.append(f"{n}. [USER CONFIRMED — {q[:60]}]: {answer_text}")
         n += 1
 
-    web = state.get("_li_web_results", "")
+    web = state.get("web_results", "")
     if web and web.strip():
         items.append(f"{n}. [WEB RESEARCH]: {web.strip()[:400]}")
         n += 1
@@ -367,19 +307,19 @@ OUTPUT: Post text only. No title, no label.\
 """
 
 
-async def generator_node(state: GlobalState) -> dict:
+async def generator_node(state: LinkedInState) -> dict:
     fact_list = _build_fact_list(state)
     try:
         response = await llm_write.ainvoke([
             SystemMessage(content=_GENERATOR_SYSTEM),
             HumanMessage(content=f"[FACTS]:\n{fact_list}\n\nWrite the LinkedIn post:"),
         ])
-        draft_v1 = response.content.strip()
+        draft = response.content.strip()
     except Exception as e:
         logger.error(f"[generator] LLM failed: {e}")
-        draft_v1 = f"[Generator error: {e}]"
-    logger.debug(f"[generator] draft length: {len(draft_v1)} chars")
-    return {"_li_draft_v1": draft_v1, "current_agent": "Generator"}
+        draft = f"[Generator error: {e}]"
+    logger.debug(f"[generator] draft length: {len(draft)} chars")
+    return {"draft": draft, "fact_list": fact_list}
 
 
 # =============================================================================
@@ -420,23 +360,23 @@ REWRITE: Keep all facts. No new facts. Fix every issue.\
 _evaluator_structured = llm_precise.with_structured_output(EvalResult)
 
 
-async def evaluator_node(state: GlobalState) -> dict:
+async def evaluator_node(state: LinkedInState) -> dict:
     fact_list = _build_fact_list(state)
-    draft_v1  = state.get("_li_draft_v1", "")
+    draft     = state.get("draft", "")
     try:
         result: EvalResult = await _evaluator_structured.ainvoke([
             SystemMessage(content=_EVALUATOR_SYSTEM),
-            HumanMessage(content=f"[FACTS]:\n{fact_list}\n\n[DRAFT]:\n{draft_v1}\n\nOutput EvalResult JSON:"),
+            HumanMessage(content=f"[FACTS]:\n{fact_list}\n\n[DRAFT]:\n{draft}\n\nOutput EvalResult JSON:"),
         ])
         if result.has_issues:
             logger.info(f"[evaluator] {len(result.issues)} issues: {[i.type for i in result.issues]}")
         else:
             logger.debug("[evaluator] no issues found")
-        draft_v2 = result.revised_post.strip() or draft_v1
+        revised_draft = result.revised_post.strip() or draft
     except Exception as e:
-        logger.warning(f"[evaluator] structured output failed ({e}) — keeping draft_v1")
-        draft_v2 = draft_v1
-    return {"_li_draft_v2": draft_v2, "current_agent": "Evaluator"}
+        logger.warning(f"[evaluator] structured output failed ({e}) — keeping draft")
+        revised_draft = draft
+    return {"revised_draft": revised_draft}
 
 
 # =============================================================================
@@ -451,54 +391,49 @@ OUTPUT: Final post only. No commentary.\
 """
 
 
-async def style_matcher_node(state: GlobalState) -> dict:
-    examples = state.get("_li_style_examples", "")
-    draft_v2 = state.get("_li_draft_v2", "")
+async def style_matcher_node(state: LinkedInState) -> dict:
+    examples      = state.get("style_examples", "")
+    revised_draft = state.get("revised_draft", "")
 
     if not examples or not examples.strip() or "No LinkedIn post" in examples:
         logger.debug("[style_matcher] no past posts — skipping")
-        final_post = draft_v2
+        final_post = revised_draft
     else:
         try:
             response = await llm_write.ainvoke([
                 SystemMessage(content=_STYLE_MATCHER_SYSTEM),
-                HumanMessage(content=f"[PAST POSTS]:\n{examples}\n\n[DRAFT]:\n{draft_v2}\n\nRewrite:"),
+                HumanMessage(content=f"[PAST POSTS]:\n{examples}\n\n[DRAFT]:\n{revised_draft}\n\nRewrite:"),
             ])
-            final_post = response.content.strip() or draft_v2
+            final_post = response.content.strip() or revised_draft
         except Exception as e:
-            logger.warning(f"[style_matcher] failed ({e}) — using draft_v2")
-            final_post = draft_v2
+            logger.warning(f"[style_matcher] failed ({e}) — using revised draft")
+            final_post = revised_draft
 
     return {
-        "messages":       [AIMessage(content=final_post)],
-        "_li_final_post": final_post,
-        "current_agent":  "Style Matcher",
+        "messages":   [AIMessage(content=final_post)],
+        "final_post": final_post,
     }
 
 
 # =============================================================================
-# Subgraph assembly
+# Subgraph factory
 # =============================================================================
 
-_g = StateGraph(GlobalState)
+def build_linkedin_subgraph():
+    """Build and compile the LinkedIn subgraph. Call this instead of using a module-level singleton."""
+    g = StateGraph(LinkedInState)
 
-_g.add_node("researcher",    researcher_node)
-_g.add_node("clarifier",     clarifier_node)
-_g.add_node("generator",     generator_node)
-_g.add_node("evaluator",     evaluator_node)
-_g.add_node("style_matcher", style_matcher_node)
+    g.add_node("researcher",    researcher_node)
+    g.add_node("clarifier",     clarifier_node)
+    g.add_node("generator",     generator_node)
+    g.add_node("evaluator",     evaluator_node)
+    g.add_node("style_matcher", style_matcher_node)
 
-_g.add_edge(START,        "researcher")
-_g.add_edge("researcher", "clarifier")
+    g.add_edge(START,            "researcher")
+    g.add_edge("researcher",     "clarifier")
+    g.add_edge("clarifier",      "generator")     # straight edge — interrupt() handles pause
+    g.add_edge("generator",      "evaluator")
+    g.add_edge("evaluator",      "style_matcher")
+    g.add_edge("style_matcher",  END)
 
-_g.add_conditional_edges(
-    "clarifier",
-    _route_after_clarifier,
-    {"generator": "generator", END: END},
-)
-
-_g.add_edge("generator",     "evaluator")
-_g.add_edge("evaluator",     "style_matcher")
-_g.add_edge("style_matcher", END)
-
-linkedin_subgraph = _g.compile()
+    return g.compile()
